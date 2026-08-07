@@ -7,8 +7,6 @@
 
 ## 运行
 
-git clone https://github.com/RaisonChen/AutoLoginJs.git
-
 ### 方式一：一键 bat（Windows，推荐）
 
 双击 `start.bat` 即可用内置默认账号常驻运行；也可带参数：

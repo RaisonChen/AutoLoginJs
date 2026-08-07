@@ -42,6 +42,8 @@ const LoginPath = '/api/v1/users/password-login';
 
 const StatusPath = '/api/v1/users/status';
 const TasksPath = '/api/v1/users/tasks';
+const TaskDetailPath = '/api/v1/users/tasks'; // + '/{id}'
+const TaskInputsPath = '/api/v1/users/tasks/user-inputs'; // + '?id={id}&limit=10'
 const WalletPath = '/api/v1/users/wallet';
 const SubscriptionPath = '/api/v1/users/subscription';
 const WsStreamPath = '/api/v1/users/tasks/stream';
@@ -203,8 +205,31 @@ async function doRefresh() {
   }
   log('刷新 status -> ' + r.status);
 
-  const t = await httpGet(BaseUrl + TasksPath + '?page=1&size=24');
-  log('刷新 tasks -> ' + t.status);
+  // 网页右上角"刷新"按钮的真实请求是针对当前活跃任务的：
+  //   GET /tasks/{id}
+  //   GET /tasks/user-inputs?id={id}&limit=10
+  // 因此优先取活跃任务ID并请求这两个接口；无活跃任务时回退到原任务列表请求。
+  let taskId = null;
+  try {
+    const tasks = await listTasks();
+    taskId = pickTaskId(tasks);
+  } catch (_) {}
+
+  if (taskId != null) {
+    try {
+      const d = await httpGet(BaseUrl + TaskDetailPath + '/' + encodeURIComponent(taskId));
+      log('刷新 task ' + taskId + ' 详情 -> ' + d.status);
+    } catch (_) {}
+    try {
+      const ui = await httpGet(
+        BaseUrl + TaskInputsPath + '?id=' + encodeURIComponent(taskId) + '&limit=10'
+      );
+      log('刷新 task ' + taskId + ' user-inputs -> ' + ui.status);
+    } catch (_) {}
+  } else {
+    const t = await httpGet(BaseUrl + TasksPath + '?page=1&size=24');
+    log('刷新 tasks(列表回退) -> ' + t.status);
+  }
 
   try {
     const w = await httpGet(BaseUrl + WalletPath);
