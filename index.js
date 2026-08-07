@@ -22,6 +22,11 @@
  * 运行：
  *   node index.js <email> <password>            # 常驻保活
  *   node index.js <email> <password> --test     # 各执行一次刷新+发送后退出（验证用）
+ *   node index.js ... --debug                    # 打开 DEBUG 日志（每个 HTTP/WS 请求耗时、字节、帧等）
+ *                                                #   等价环境变量：MC_DEBUG=1
+ *
+ * 日志分级：INFO 常规流程 / WARN 非 2xx 或降级重试 / ERROR 异常失败 / DEBUG 排查细节（默认关）。
+ * 每轮刷新/发送带短 id（R1/C1...），便于把同一轮的多条日志串联排查。
  *
  * 依赖：仅 Node 内置模块（需 Node 20+，使用内置 fetch / WebSocket / crypto）。
  */
@@ -47,6 +52,7 @@ const TaskInputsPath = '/api/v1/users/tasks/user-inputs'; // + '?id={id}&limit=1
 const WalletPath = '/api/v1/users/wallet';
 const SubscriptionPath = '/api/v1/users/subscription';
 const WsStreamPath = '/api/v1/users/tasks/stream';
+const WsControlPath = '/api/v1/users/tasks/control';
 
 // WebSocket 发送模式：mode=new 发起一次新的用户输入；mode=attach 只读附着。
 const WsMode = 'new';
@@ -110,12 +116,17 @@ let _password = '';
 let _config = DefaultConfig;
 // 登录互斥：避免两个循环同时触发重登。
 let _loginPromise = null;
+// 循环计数：给每次刷新/发送一个短 id（R1/C1...），方便在日志里把同一轮的多条串起来。
+let _refreshSeq = 0;
+let _chatSeq = 0;
 
 // ===============================================================
 // 入口
 // ===============================================================
 async function main() {
   const args = process.argv.slice(2);
+  // DEBUG 开关：--debug 参数或环境变量 MC_DEBUG=1/true。
+  setDebug(args.includes('--debug') || /^(1|true|yes)$/i.test(process.env.MC_DEBUG || ''));
   _config = loadConfig();
   // 账号/密码优先级：命令行参数 > config.json > 内置默认。
   const argEmail = args[0] && !args[0].startsWith('--') ? args[0] : null;
@@ -124,10 +135,16 @@ async function main() {
   _password = argPwd || _config.password;
   const testOnce = args.includes('--test');
 
+  logi('启动：账号=' + _email + '，DEBUG=' + (_debug ? '开' : '关') + (testOnce ? '，模式=--test' : ''));
+  logi('配置：刷新 ' + _config.refreshMinMinutes + '~' + _config.refreshMaxMinutes + ' 分钟，'
+    + '发送 ' + _config.chatMinMinutes + '~' + _config.chatMaxMinutes + ' 分钟。');
+
   try {
     // 1. 读取本地会话
     const loaded = loadSession();
-    log(loaded ? '已读取本地会话 session.json。' : '未找到本地会话。');
+    logi(loaded
+      ? '已读取本地会话 session.json（Cookie: ' + Array.from(Cookies.keys()).join(',') + '）。'
+      : '未找到本地会话。');
 
     // 2. 校验登录状态
     const valid = loaded && (await checkLoginValid());
@@ -156,7 +173,7 @@ async function main() {
     log(`保活已启动：刷新 ${_config.refreshMinMinutes}~${_config.refreshMaxMinutes} 分钟/次，`
       + `发送对话 ${_config.chatMinMinutes}~${_config.chatMaxMinutes} 分钟/次。按 Ctrl+C 退出。`);
   } catch (ex) {
-    log('致命错误：' + (ex && ex.message ? ex.message : ex));
+    loge('致命错误：' + errMsg(ex));
     process.exit(1);
   }
 }
@@ -171,7 +188,7 @@ async function refreshLoop() {
     try {
       await doRefresh();
     } catch (ex) {
-      log('刷新异常：' + (ex && ex.message ? ex.message : ex));
+      loge('刷新异常：' + errMsg(ex));
     }
     const ms = nextRandom(_config.refreshMinMinutes * 60 * 1000, _config.refreshMaxMinutes * 60 * 1000 + 1);
     log(`下次刷新约在 ${(ms / 60000).toFixed(1)} 分钟后。`);
@@ -186,7 +203,7 @@ async function chatLoop() {
     try {
       await doChatOnce();
     } catch (ex) {
-      log('发送对话异常：' + (ex && ex.message ? ex.message : ex));
+      loge('发送对话异常：' + errMsg(ex));
     }
     const ms = nextRandom(_config.chatMinMinutes * 60 * 1000, _config.chatMaxMinutes * 60 * 1000 + 1);
     log(`下次发送对话约在 ${(ms / 60000).toFixed(1)} 分钟后。`);
@@ -198,12 +215,17 @@ async function chatLoop() {
 // 刷新（模拟右上角刷新按钮）
 // ===============================================================
 async function doRefresh() {
+  const cid = 'R' + (++_refreshSeq);
+  const t0 = Date.now();
+  logi(cid + ' 刷新开始');
+
   let r = await httpGet(BaseUrl + StatusPath);
   if (r.status === 401) {
+    logw(cid + ' status 返回 401，触发重登 ...');
     await reloginIfNeeded();
     r = await httpGet(BaseUrl + StatusPath);
   }
-  log('刷新 status -> ' + r.status);
+  logi(cid + ' status -> ' + r.status);
 
   // 网页右上角"刷新"按钮的真实请求是针对当前活跃任务的：
   //   GET /tasks/{id}
@@ -213,64 +235,101 @@ async function doRefresh() {
   try {
     const tasks = await listTasks();
     taskId = pickTaskId(tasks);
-  } catch (_) {}
+    logd(cid + ' 活跃任务数=' + (tasks ? tasks.length : 0) + '，选中 taskId=' + (taskId || '(无)'));
+  } catch (ex) {
+    logw(cid + ' 获取任务列表失败：' + errMsg(ex));
+  }
 
   if (taskId != null) {
     try {
       const d = await httpGet(BaseUrl + TaskDetailPath + '/' + encodeURIComponent(taskId));
-      log('刷新 task ' + taskId + ' 详情 -> ' + d.status);
-    } catch (_) {}
+      logi(cid + ' task ' + taskId + ' 详情 -> ' + d.status);
+    } catch (ex) {
+      logw(cid + ' 拉取任务详情异常：' + errMsg(ex));
+    }
     try {
       const ui = await httpGet(
         BaseUrl + TaskInputsPath + '?id=' + encodeURIComponent(taskId) + '&limit=10'
       );
-      log('刷新 task ' + taskId + ' user-inputs -> ' + ui.status);
-    } catch (_) {}
+      logi(cid + ' task ' + taskId + ' user-inputs -> ' + ui.status);
+    } catch (ex) {
+      logw(cid + ' 拉取 user-inputs 异常：' + errMsg(ex));
+    }
   } else {
     const t = await httpGet(BaseUrl + TasksPath + '?page=1&size=24');
-    log('刷新 tasks(列表回退) -> ' + t.status);
+    logi(cid + ' tasks(列表回退) -> ' + t.status);
   }
 
   try {
     const w = await httpGet(BaseUrl + WalletPath);
-    log('刷新 wallet -> ' + w.status);
-  } catch (_) {}
+    logi(cid + ' wallet -> ' + w.status);
+  } catch (ex) {
+    logw(cid + ' 拉取 wallet 异常：' + errMsg(ex));
+  }
   try {
     const s = await httpGet(BaseUrl + SubscriptionPath);
-    log('刷新 subscription -> ' + s.status);
-  } catch (_) {}
+    logi(cid + ' subscription -> ' + s.status);
+  } catch (ex) {
+    logw(cid + ' 拉取 subscription 异常：' + errMsg(ex));
+  }
+
+  logi(cid + ' 刷新完成，用时 ' + (Date.now() - t0) + 'ms');
 }
 
 // ===============================================================
 // 发送对话（优先已有任务；无则创建新任务）
 // ===============================================================
 async function doChatOnce() {
-  if (!(await checkLoginValid())) await reloginIfNeeded();
+  const cid = 'C' + (++_chatSeq);
+  const t0 = Date.now();
+  logi(cid + ' 发送对话开始');
+
+  if (!(await checkLoginValid())) {
+    logw(cid + ' 会话校验未通过，触发重登 ...');
+    await reloginIfNeeded();
+  }
 
   const tasks = await listTasks();
   let taskId = pickTaskId(tasks);
+  let reusedTask = false;
+  logd(cid + ' 可用任务数=' + (tasks ? tasks.length : 0) + '，选中 taskId=' + (taskId || '(无)'));
 
   if (taskId == null) {
-    log('无可用任务，创建新任务 ...');
+    logi(cid + ' 无可用任务，创建新任务 ...');
     taskId = await createNewTask(randomContent());
     if (taskId == null) {
-      log('创建新任务失败，本次发送跳过。');
+      logw(cid + ' 创建新任务失败，本次发送跳过。用时 ' + (Date.now() - t0) + 'ms');
       return;
     }
-    log('已创建新任务：' + taskId);
+    logi(cid + ' 已创建新任务：' + taskId);
+  } else {
+    reusedTask = true;
+    logd(cid + ' 复用已有任务：' + taskId);
+  }
+
+  // 复用已有任务时，先重置上下文（等价网页"重置上下文"按钮：restart + load_session:false），
+  // 避免历史对话累积导致单次 token 损耗过大。新建任务本身就是空上下文，无需重置。
+  if (reusedTask) {
+    const rt = Date.now();
+    const reset = await resetContext(taskId);
+    if (reset) logi(cid + ' 重置上下文成功（任务 ' + taskId + '，' + (Date.now() - rt) + 'ms）');
+    else logw(cid + ' 重置上下文失败/超时（任务 ' + taskId + '，' + (Date.now() - rt) + 'ms），仍继续发送');
   }
 
   const content = randomContent();
+  logd(cid + ' 本次内容：' + content);
+  const st = Date.now();
   const ok = await sendViaWebSocket(taskId, content);
   if (ok) {
-    log('已向任务 ' + taskId + ' 发送对话：' + content);
+    logi(cid + ' 已向任务 ' + taskId + ' 发送对话（' + (Date.now() - st) + 'ms）：' + content);
   } else {
     // 降级：WebSocket 失败时用创建新任务作为保底。
-    log('WebSocket 发送失败，降级为创建新任务保底 ...');
+    logw(cid + ' WebSocket 发送失败，降级为创建新任务保底 ...');
     const fallbackId = await createNewTask(content);
-    if (fallbackId != null) log('降级成功，新任务：' + fallbackId + '，内容：' + content);
-    else log('降级创建任务也失败，本次发送跳过。');
+    if (fallbackId != null) logi(cid + ' 降级成功，新任务：' + fallbackId + '，内容：' + content);
+    else loge(cid + ' 降级创建任务也失败，本次发送跳过。');
   }
+  logi(cid + ' 发送对话完成，用时 ' + (Date.now() - t0) + 'ms');
 }
 
 async function listTasks() {
@@ -331,7 +390,7 @@ async function createNewTask(content) {
     r = await sendRequest('POST', BaseUrl + TasksPath, body);
   }
   if (r.status < 200 || r.status >= 300) {
-    log('创建任务返回 ' + r.status + '：' + trunc(r.body, 200));
+    logw('创建任务返回 ' + r.status + '：' + trunc(r.body, 200));
     return null;
   }
   try {
@@ -407,8 +466,11 @@ async function reloginIfNeeded() {
   // 用一个共享 Promise 做互斥，避免两个循环并发重登。
   if (_loginPromise) return _loginPromise;
   _loginPromise = (async () => {
-    if (await checkLoginValid()) return;
-    log('检测到会话失效，重新登录 ...');
+    if (await checkLoginValid()) {
+      logd('reloginIfNeeded: 会话仍有效，无需重登。');
+      return;
+    }
+    logw('检测到会话失效，重新登录 ...');
     await doFullLogin(_email, _password);
   })();
   try {
@@ -550,19 +612,34 @@ async function sendRequest(method, url, jsonBody) {
     init.body = jsonBody || '{}';
   }
 
+  const sp = shortPath(url);
+  const reqBytes = init.body ? Buffer.byteLength(init.body, 'utf8') : 0;
+  const t0 = Date.now();
+  logd('HTTP -> ' + method + ' ' + sp + (reqBytes ? ' (body ' + reqBytes + 'B)' : ''));
   try {
     const resp = await fetch(url, init);
     // 收集 Set-Cookie（Node fetch 用 getSetCookie 返回数组）。
-    captureSetCookies(resp);
+    const setCookieNames = captureSetCookies(resp);
     const body = await resp.text();
+    const dt = Date.now() - t0;
+    const bytes = Buffer.byteLength(body || '', 'utf8');
+    const cookieNote = setCookieNames.length ? ' set-cookie=[' + setCookieNames.join(',') + ']' : '';
+    logd('HTTP <- ' + resp.status + ' ' + method + ' ' + sp + ' ' + dt + 'ms ' + bytes + 'B' + cookieNote);
+    // 非 2xx（且非 401，401 有专门的重登处理）在 WARN 级别附带响应体预览，便于排查。
+    if ((resp.status < 200 || resp.status >= 300) && resp.status !== 401) {
+      logw('HTTP ' + resp.status + ' ' + method + ' ' + sp + ' ' + dt + 'ms 响应预览：' + trunc(body, 200));
+    }
     return { status: resp.status, body: body };
   } catch (ex) {
-    return { status: 0, body: 'FetchError: ' + (ex && ex.message ? ex.message : ex) };
+    const dt = Date.now() - t0;
+    loge('HTTP 请求失败 ' + method + ' ' + sp + ' ' + dt + 'ms：' + errMsg(ex));
+    return { status: 0, body: 'FetchError: ' + errMsg(ex) };
   }
 }
 
 function captureSetCookies(resp) {
   let list = [];
+  const names = [];
   try {
     if (typeof resp.headers.getSetCookie === 'function') {
       list = resp.headers.getSetCookie();
@@ -579,9 +656,13 @@ function captureSetCookies(resp) {
     if (eq > 0) {
       const name = pair.slice(0, eq).trim();
       const value = pair.slice(eq + 1).trim();
-      if (name) Cookies.set(name, value);
+      if (name) {
+        Cookies.set(name, value);
+        names.push(name);
+      }
     }
   }
+  return names;
 }
 
 function buildCookieHeader() {
@@ -642,6 +723,8 @@ function loadSession() {
 function sendViaWebSocket(taskId, content) {
   return new Promise((resolve) => {
     let settled = false;
+    let pings = 0;
+    const wsT0 = Date.now();
     const done = (ok) => {
       if (settled) return;
       settled = true;
@@ -653,6 +736,7 @@ function sendViaWebSocket(taskId, content) {
 
     const query = '?id=' + encodeURIComponent(taskId) + '&mode=' + WsMode;
     const url = 'wss://' + Host + WsStreamPath + query;
+    logd('WS(send) 连接 ' + shortPath(url));
 
     // 内置 WebSocket 支持传 headers（携带 Cookie/Origin/UA 以通过鉴权）。
     let ws;
@@ -665,26 +749,31 @@ function sendViaWebSocket(taskId, content) {
         },
       });
     } catch (ex) {
-      log('WebSocket 构造异常：' + (ex && ex.message ? ex.message : ex));
+      loge('WS(send) 构造异常：' + errMsg(ex));
       resolve(false);
       return;
     }
 
     // 整体超时（握手 + 发送 + 读一小段）。
-    const overall = setTimeout(() => done(true), 9000);
+    const overall = setTimeout(() => {
+      logw('WS(send) 整体超时（9s），按成功处理（帧已发出）。ping=' + pings);
+      done(true);
+    }, 9000);
 
     ws.addEventListener('open', () => {
+      logd('WS(send) 握手成功（' + (Date.now() - wsT0) + 'ms），发送用户输入帧 ...');
       try {
         const inner = JSON.stringify({ content: base64Utf8(content), attachments: [] });
         const frame = JSON.stringify({ type: 'user-input', data: base64Utf8(inner) });
         ws.send(frame);
+        logd('WS(send) 已发送帧 ' + Buffer.byteLength(frame, 'utf8') + 'B，等待 6s 读心跳 ...');
         // 已发出，给服务端 6 秒处理并回读心跳。
         setTimeout(() => {
           clearTimeout(overall);
           done(true);
         }, 6000);
       } catch (ex) {
-        log('WebSocket 发送异常：' + (ex && ex.message ? ex.message : ex));
+        loge('WS(send) 发送异常：' + errMsg(ex));
         clearTimeout(overall);
         done(false);
       }
@@ -695,19 +784,23 @@ function sendViaWebSocket(taskId, content) {
       try {
         const txt = typeof evt.data === 'string' ? evt.data : '';
         if (txt.indexOf('"type":"ping"') >= 0) {
+          pings++;
           ws.send(JSON.stringify({ type: 'pong', data: null }));
+          logd('WS(send) 收到 ping，已回 pong（第 ' + pings + ' 次）');
         }
       } catch (_) {}
     });
 
     ws.addEventListener('error', (evt) => {
-      log('WebSocket 错误：' + (evt && evt.message ? evt.message : '连接失败'));
+      loge('WS(send) 错误：' + (evt && evt.message ? evt.message : '连接失败'));
       clearTimeout(overall);
       done(false);
     });
 
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (evt) => {
       // 若在发送前就关闭则视为失败；发送后关闭由上面的定时器处理。
+      logd('WS(send) 关闭 code=' + (evt && evt.code != null ? evt.code : '?')
+        + '，存活 ' + (Date.now() - wsT0) + 'ms，ping=' + pings);
       if (!settled) {
         clearTimeout(overall);
         done(false);
@@ -718,6 +811,132 @@ function sendViaWebSocket(taskId, content) {
 
 function base64Utf8(s) {
   return Buffer.from(s, 'utf8').toString('base64');
+}
+
+// ===============================================================
+// 重置上下文（等价网页右上角"重置上下文"按钮）
+// ---------------------------------------------------------------
+// 抓包/前端源码确认：走任务控制通道 WebSocket，而非 REST。
+//   URL：wss://<host>/api/v1/users/tasks/control?id={taskId}
+//   发送：{"type":"call","kind":"restart","data": BASE64( {"request_id":<uuid>,"load_session":false} )}
+//   load_session:false = 重启 Agent 且不加载旧会话，即清空上下文。
+//   成功：{"type":"call-response","data": BASE64( {"request_id":<同一uuid>,"success":true} )}
+// data 用标准 base64(utf8)，与 sendViaWebSocket 内层编码一致。
+function resetContext(taskId) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const requestId = genUuid();
+    const wsT0 = Date.now();
+    let ws;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws.close();
+      } catch (_) {}
+      resolve(ok);
+    };
+
+    const url = 'wss://' + Host + WsControlPath + '?id=' + encodeURIComponent(taskId);
+    logd('WS(reset) 连接 ' + shortPath(url) + '，request_id=' + requestId);
+    try {
+      ws = new WebSocket(url, {
+        headers: {
+          Cookie: buildCookieHeader(),
+          Origin: BaseUrl,
+          'User-Agent': UserAgent,
+        },
+      });
+    } catch (ex) {
+      loge('WS(reset) 构造异常：' + errMsg(ex));
+      resolve(false);
+      return;
+    }
+
+    // restart 服务端处理较慢，给足超时（前端 RESTART_TIMEOUT 约 15s）。
+    const overall = setTimeout(() => {
+      logw('WS(reset) 等待 call-response 超时（20s），视为失败。request_id=' + requestId);
+      done(false);
+    }, 20000);
+
+    ws.addEventListener('open', () => {
+      logd('WS(reset) 握手成功（' + (Date.now() - wsT0) + 'ms），发送 restart(load_session=false) ...');
+      try {
+        const inner = JSON.stringify({ request_id: requestId, load_session: false });
+        const frame = JSON.stringify({ type: 'call', kind: 'restart', data: base64Utf8(inner) });
+        ws.send(frame);
+      } catch (ex) {
+        loge('WS(reset) 发送异常：' + errMsg(ex));
+        clearTimeout(overall);
+        done(false);
+      }
+    });
+
+    ws.addEventListener('message', (evt) => {
+      try {
+        const txt = typeof evt.data === 'string' ? evt.data : '';
+        if (txt.indexOf('"type":"ping"') >= 0) {
+          ws.send(JSON.stringify({ type: 'pong', data: null }));
+          return;
+        }
+        if (txt.indexOf('"type":"call-response"') < 0) {
+          logd('WS(reset) 收到其它帧：' + trunc(txt, 120));
+          return;
+        }
+        // 解出内层 data（base64(utf8(json))），校验 request_id 与 success。
+        const payload = decodeControlPayload(txt);
+        if (!payload) {
+          logw('WS(reset) call-response 解析失败：' + trunc(txt, 120));
+          return;
+        }
+        if (payload.request_id && payload.request_id !== requestId) {
+          logd('WS(reset) 忽略非本次 request_id 的响应：' + payload.request_id);
+          return; // 不是本次调用
+        }
+        clearTimeout(overall);
+        logd('WS(reset) 收到 call-response，success=' + payload.success + '（' + (Date.now() - wsT0) + 'ms）');
+        done(payload.success === true);
+      } catch (ex) {
+        logw('WS(reset) 处理消息异常：' + errMsg(ex));
+      }
+    });
+
+    ws.addEventListener('error', (evt) => {
+      loge('WS(reset) 错误：' + (evt && evt.message ? evt.message : '连接失败'));
+      clearTimeout(overall);
+      done(false);
+    });
+
+    ws.addEventListener('close', (evt) => {
+      logd('WS(reset) 关闭 code=' + (evt && evt.code != null ? evt.code : '?')
+        + '，存活 ' + (Date.now() - wsT0) + 'ms');
+      if (!settled) {
+        clearTimeout(overall);
+        done(false);
+      }
+    });
+  });
+}
+
+// 从控制通道 call-response 帧里解出内层 payload（{"data": BASE64(utf8(json))}）。
+function decodeControlPayload(frameText) {
+  const b64 = extractString(frameText, 'data');
+  if (!b64) return null;
+  try {
+    const json = Buffer.from(b64, 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch (_) {
+    return null;
+  }
+}
+
+// 生成 request_id（优先内置 crypto.randomUUID，回退时间戳+随机）。
+function genUuid() {
+  try {
+    const crypto = require('crypto');
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  } catch (_) {}
+  return Date.now() + '-' + Math.random().toString(16).slice(2);
 }
 
 // ===============================================================
@@ -784,12 +1003,56 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function log(msg) {
+// ===============================================================
+// 日志（分级 + 时间戳；DEBUG 默认关闭，用 --debug 或 MC_DEBUG=1 打开）
+// ---------------------------------------------------------------
+// - logi/log  : INFO  常规流程
+// - logw      : WARN  可疑但不致命（非 2xx、降级、重试）
+// - loge      : ERROR 异常/失败
+// - logd      : DEBUG 排查细节（每个 HTTP/WS 请求耗时、字节数、帧内容等），默认不打印
+let _debug = false;
+
+function setDebug(on) {
+  _debug = !!on;
+}
+
+function _emit(level, msg) {
   const now = new Date();
   const hh = String(now.getHours()).padStart(2, '0');
   const mm = String(now.getMinutes()).padStart(2, '0');
   const ss = String(now.getSeconds()).padStart(2, '0');
-  console.log('[' + hh + ':' + mm + ':' + ss + '] ' + msg);
+  const ms = String(now.getMilliseconds()).padStart(3, '0');
+  const line = '[' + hh + ':' + mm + ':' + ss + '.' + ms + '] [' + level + '] ' + msg;
+  if (level === 'ERROR') console.error(line);
+  else if (level === 'WARN') console.warn(line);
+  else console.log(line);
+}
+
+function logi(msg) { _emit('INFO', msg); }
+function logw(msg) { _emit('WARN', msg); }
+function loge(msg) { _emit('ERROR', msg); }
+function logd(msg) { if (_debug) _emit('DEBUG', msg); }
+// 兼容旧调用：log() == INFO。
+function log(msg) { _emit('INFO', msg); }
+
+// 把 error/异常对象规整成可读字符串。
+function errMsg(ex) {
+  if (!ex) return '(unknown)';
+  if (typeof ex === 'string') return ex;
+  let s = ex.message ? ex.message : String(ex);
+  if (ex.code) s += ' [code=' + ex.code + ']';
+  if (ex.cause && ex.cause.message) s += ' <- ' + ex.cause.message;
+  return s;
+}
+
+// 从完整 URL 里取出 path（含 query）用于精简日志，避免每行都刷长域名。
+function shortPath(url) {
+  try {
+    const u = new URL(url);
+    return u.pathname + (u.search || '');
+  } catch (_) {
+    return url;
+  }
 }
 
 main();
