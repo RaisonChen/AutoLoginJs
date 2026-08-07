@@ -1,0 +1,14 @@
+{
+  "name": "monkeycode-autologin-js",
+  "version": "1.0.0",
+  "description": "MonkeyCode (monkeycode-ai.com) 登录保活守护程序（Node.js 版，零依赖）",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test-once": "node index.js 6553458@qq.com Subway88 --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
+}
