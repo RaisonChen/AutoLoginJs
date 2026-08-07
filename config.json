@@ -3,6 +3,6 @@
   "password": "Subway88",
   "refreshMinMinutes": 4,
   "refreshMaxMinutes": 5,
-  "chatMinMinutes": 1840,
-  "chatMaxMinutes": 1780
+  "chatMinMinutes": 1780,
+  "chatMaxMinutes": 1840
 }
