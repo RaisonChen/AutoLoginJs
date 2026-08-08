@@ -10,8 +10,9 @@
  *   3. 两个独立随机定时循环保活：
  *        - 每 4~5 分钟（随机）刷新一次（status/tasks/wallet/subscription）。
  *        - 每 13~15 分钟（随机）向 AI 任务发送一次随机对话：
- *            有可用任务 -> 选任务通过 WebSocket 发送；
- *            无可用任务 -> 先 POST 创建新任务再发送。
+ *            账号永远只有一个任务，程序绝不创建/变动任务（否则开发环境全部要重配）。
+ *            拉全部任务取第一个 -> 若上一轮会话仍在执行则先发 user-cancel 终止会话
+ *            -> 重置上下文 -> 通过 WebSocket 发送。拉不到任务则跳过本轮。
  *
  * 登录流程：
  *   1. POST /api/v1/public/captcha/challenge  -> {challenge:{c,s,d}, token}
@@ -57,17 +58,14 @@ const WsControlPath = '/api/v1/users/tasks/control';
 // WebSocket 发送模式：mode=new 发起一次新的用户输入；mode=attach 只读附着。
 const WsMode = 'new';
 
-// 创建新任务时使用的已知可用资源。
-const DefaultModelId = 'deepseek-v4-flash';
-const DefaultImageId = '2e214f06-79ba-4535-9ac1-89adc2d9c6cc';
-const DefaultHostId = 'public_host_9c689e7a_99c6_4db3';
-
 const UserAgent =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36';
 
 const SessionFile = path.join(__dirname, 'session.json');
 const ConfigFile = path.join(__dirname, 'config.json');
+// 日志目录：按天生成 logs/YYYY-MM-DD.log，只保留最近 N 天（见 DefaultConfig.logRetentionDays）。
+const LogDir = path.join(__dirname, 'logs');
 
 // 保活间隔默认值（分钟）。可被 config.json 覆盖。
 const DefaultConfig = {
@@ -77,6 +75,12 @@ const DefaultConfig = {
   refreshMaxMinutes: 5,
   chatMinMinutes: 13,
   chatMaxMinutes: 15,
+  retryDelayMinutes: 1,
+  // 单轮会话等待 task-ended 的超时（分钟）。超时未结束即判定本轮卡住/没结束，
+  // 标记失败并触发重试；下一轮发送前会先 user-cancel 终止旧会话。
+  sessionTimeoutMinutes: 1,
+  // 日志文件保留天数：logs/ 下超过该天数的 *.log 会被删除（0 或负数表示不清理）。
+  logRetentionDays: 3,
 };
 
 // ===============================================================
@@ -103,6 +107,13 @@ function loadConfig() {
   cfg.refreshMaxMinutes = Math.max(cfg.refreshMinMinutes, Number(cfg.refreshMaxMinutes) || DefaultConfig.refreshMaxMinutes);
   cfg.chatMinMinutes = Math.max(0.1, Number(cfg.chatMinMinutes) || DefaultConfig.chatMinMinutes);
   cfg.chatMaxMinutes = Math.max(cfg.chatMinMinutes, Number(cfg.chatMaxMinutes) || DefaultConfig.chatMaxMinutes);
+  cfg.retryDelayMinutes = Math.max(0.05, Number(cfg.retryDelayMinutes) || DefaultConfig.retryDelayMinutes);
+  cfg.sessionTimeoutMinutes = Math.max(0.1, Number(cfg.sessionTimeoutMinutes) || DefaultConfig.sessionTimeoutMinutes);
+  // 保留天数：允许 0（不清理）；其余取整且至少为 1。
+  {
+    const n = Number(cfg.logRetentionDays);
+    cfg.logRetentionDays = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : DefaultConfig.logRetentionDays;
+  }
   return cfg;
 }
 
@@ -119,6 +130,9 @@ let _loginPromise = null;
 // 循环计数：给每次刷新/发送一个短 id（R1/C1...），方便在日志里把同一轮的多条串起来。
 let _refreshSeq = 0;
 let _chatSeq = 0;
+// 上一轮会话是否“没正常结束”（发送后超时没等到 task-ended = 卡住）。
+// 为 true 时，下一轮发送前会先 user-cancel 终止那条卡住的旧会话，再发新消息。
+let _lastSessionStuck = false;
 
 // ===============================================================
 // 入口
@@ -128,6 +142,8 @@ async function main() {
   // DEBUG 开关：--debug 参数或环境变量 MC_DEBUG=1/true。
   setDebug(args.includes('--debug') || /^(1|true|yes)$/i.test(process.env.MC_DEBUG || ''));
   _config = loadConfig();
+  // 初始化日志文件：logs/YYYY-MM-DD.log，按 config.logRetentionDays 只保留最近 N 天。
+  initLogFile(_config.logRetentionDays);
   // 账号/密码优先级：命令行参数 > config.json > 内置默认。
   const argEmail = args[0] && !args[0].startsWith('--') ? args[0] : null;
   const argPwd = args[1] && !args[1].startsWith('--') ? args[1] : null;
@@ -138,6 +154,8 @@ async function main() {
   logi('启动：账号=' + _email + '，DEBUG=' + (_debug ? '开' : '关') + (testOnce ? '，模式=--test' : ''));
   logi('配置：刷新 ' + _config.refreshMinMinutes + '~' + _config.refreshMaxMinutes + ' 分钟，'
     + '发送 ' + _config.chatMinMinutes + '~' + _config.chatMaxMinutes + ' 分钟。');
+  logi('日志：写入 ' + path.join('logs', _logDateKey + '.log')
+    + (_logRetentionDays > 0 ? '，保留最近 ' + _logRetentionDays + ' 天。' : '，不自动清理。'));
 
   try {
     // 1. 读取本地会话
@@ -185,13 +203,22 @@ async function refreshLoop() {
   // 无限循环：每次动作后按随机间隔 sleep。
   // 使用递归 setTimeout 风格，避免 setInterval 的漂移与重入。
   for (;;) {
+    let failed = false;
     try {
       await doRefresh();
     } catch (ex) {
+      failed = true;
       loge('刷新异常：' + errMsg(ex));
     }
-    const ms = nextRandom(_config.refreshMinMinutes * 60 * 1000, _config.refreshMaxMinutes * 60 * 1000 + 1);
-    log(`下次刷新约在 ${(ms / 60000).toFixed(1)} 分钟后。`);
+    let ms;
+    if (failed) {
+      // 失败：按 config 的 retryDelayMinutes 短间隔重试，而非等到下一个正常周期。
+      ms = _config.retryDelayMinutes * 60 * 1000;
+      logw(`刷新失败，将在 ${(ms / 60000).toFixed(1)} 分钟后重试。`);
+    } else {
+      ms = nextRandom(_config.refreshMinMinutes * 60 * 1000, _config.refreshMaxMinutes * 60 * 1000 + 1);
+      log(`下次刷新约在 ${(ms / 60000).toFixed(1)} 分钟后。`);
+    }
     await sleep(ms);
   }
 }
@@ -200,13 +227,22 @@ async function chatLoop() {
   // 稍微错开，避免与刷新扎堆。
   await sleep(nextRandom(20 * 1000, 60 * 1000));
   for (;;) {
+    let failed = false;
     try {
       await doChatOnce();
     } catch (ex) {
+      failed = true;
       loge('发送对话异常：' + errMsg(ex));
     }
-    const ms = nextRandom(_config.chatMinMinutes * 60 * 1000, _config.chatMaxMinutes * 60 * 1000 + 1);
-    log(`下次发送对话约在 ${(ms / 60000).toFixed(1)} 分钟后。`);
+    let ms;
+    if (failed) {
+      // 失败：按 config 的 retryDelayMinutes 短间隔重试。
+      ms = _config.retryDelayMinutes * 60 * 1000;
+      logw(`发送对话失败，将在 ${(ms / 60000).toFixed(1)} 分钟后重试。`);
+    } else {
+      ms = nextRandom(_config.chatMinMinutes * 60 * 1000, _config.chatMaxMinutes * 60 * 1000 + 1);
+      log(`下次发送对话约在 ${(ms / 60000).toFixed(1)} 分钟后。`);
+    }
     await sleep(ms);
   }
 }
@@ -277,7 +313,7 @@ async function doRefresh() {
 }
 
 // ===============================================================
-// 发送对话（优先已有任务；无则创建新任务）
+// 发送对话（复用唯一任务；用 stream 的 task-ended 判定会话是否真正结束）
 // ===============================================================
 async function doChatOnce() {
   const cid = 'C' + (++_chatSeq);
@@ -291,25 +327,32 @@ async function doChatOnce() {
 
   const tasks = await listTasks();
   let taskId = pickTaskId(tasks);
-  let reusedTask = false;
   logd(cid + ' 可用任务数=' + (tasks ? tasks.length : 0) + '，选中 taskId=' + (taskId || '(无)'));
 
   if (taskId == null) {
-    logi(cid + ' 无可用任务，创建新任务 ...');
-    taskId = await createNewTask(randomContent());
-    if (taskId == null) {
-      logw(cid + ' 创建新任务失败，本次发送跳过。用时 ' + (Date.now() - t0) + 'ms');
-      return;
-    }
-    logi(cid + ' 已创建新任务：' + taskId);
-  } else {
-    reusedTask = true;
-    logd(cid + ' 复用已有任务：' + taskId);
+    // 按约束：账号永远只有一个任务，程序绝不创建任务（创建/变动任务会导致开发环境全部重配）。
+    // 拉不到任务时只跳过本轮并告警，抛出让 chatLoop 按 retryDelayMinutes 稍后重试。
+    throw new Error('未找到任何任务（程序不会创建任务），本轮发送跳过');
+  }
+  logd(cid + ' 复用唯一任务：' + taskId);
+
+  // 仅当“上一轮会话没正常结束（卡住）”时，才先终止旧会话。
+  // 判据来自上一轮 sendViaWebSocket 是否在超时内收到 task-ended（_lastSessionStuck），
+  // 【不再】用任务顶层 status（它对 develop 任务恒为 processing，会导致每轮误判）。
+  // user-cancel 只终止会话/当前对话轮次，绝不触碰任务/VM/文件。
+  if (_lastSessionStuck) {
+    logw(cid + ' [会话卡住] 上一轮会话超时未结束，先 user-cancel 终止旧会话'
+      + '｜会话ID=' + cid + '｜任务ID=' + taskId + '｜时刻=' + nowStamp());
+    const ct = Date.now();
+    const cancelled = await cancelSession(taskId);
+    if (cancelled) logi(cid + ' [会话卡住] user-cancel 已完成（' + (Date.now() - ct) + 'ms）');
+    else logw(cid + ' [会话卡住] user-cancel 失败/超时（' + (Date.now() - ct) + 'ms），仍继续发送');
+    _lastSessionStuck = false; // 无论成功与否都清标记，避免下一轮重复取消。
   }
 
-  // 复用已有任务时，先重置上下文（等价网页"重置上下文"按钮：restart + load_session:false），
-  // 避免历史对话累积导致单次 token 损耗过大。新建任务本身就是空上下文，无需重置。
-  if (reusedTask) {
+  // 发送前先重置上下文（等价网页"重置上下文"按钮：restart + load_session:false），
+  // 避免历史对话累积导致单次 token 损耗过大。仅重置会话上下文，不触碰任务/VM/文件。
+  {
     const rt = Date.now();
     const reset = await resetContext(taskId);
     if (reset) logi(cid + ' 重置上下文成功（任务 ' + taskId + '，' + (Date.now() - rt) + 'ms）');
@@ -319,21 +362,34 @@ async function doChatOnce() {
   const content = randomContent();
   logd(cid + ' 本次内容：' + content);
   const st = Date.now();
-  const ok = await sendViaWebSocket(taskId, content);
-  if (ok) {
-    logi(cid + ' 已向任务 ' + taskId + ' 发送对话（' + (Date.now() - st) + 'ms）：' + content);
+  const timeoutMs = _config.sessionTimeoutMinutes * 60 * 1000;
+  const res = await sendViaWebSocket(taskId, content, timeoutMs);
+
+  if (!res.ok) {
+    // 连接/发送失败：抛出让 chatLoop 按 retryDelayMinutes 在同一任务上重试。
+    throw new Error('WebSocket 发送失败（连接/发送异常）');
+  }
+  if (res.ended) {
+    // 收到 task-ended = 本轮会话真正完成。
+    _lastSessionStuck = false;
+    logi(cid + ' 会话完成｜任务 ' + taskId + '｜exit_code=' + res.exitCode
+      + '｜用时 ' + (Date.now() - st) + 'ms｜内容：' + content);
   } else {
-    // 降级：WebSocket 失败时用创建新任务作为保底。
-    logw(cid + ' WebSocket 发送失败，降级为创建新任务保底 ...');
-    const fallbackId = await createNewTask(content);
-    if (fallbackId != null) logi(cid + ' 降级成功，新任务：' + fallbackId + '，内容：' + content);
-    else loge(cid + ' 降级创建任务也失败，本次发送跳过。');
+    // 帧已发出但超时没等到 task-ended = 本轮没结束/卡住。
+    // 标记卡住，下一轮发送前会先 user-cancel；本轮抛出触发 retryDelayMinutes 重试。
+    _lastSessionStuck = true;
+    logw(cid + ' [会话未结束] 发送后 ' + _config.sessionTimeoutMinutes + ' 分钟内未收到 task-ended'
+      + '（started=' + res.started + '）｜任务 ' + taskId + '｜时刻=' + nowStamp()
+      + '｜下一轮发送前将先终止该会话。');
+    throw new Error('会话未在 ' + _config.sessionTimeoutMinutes + ' 分钟内结束（卡住）');
   }
   logi(cid + ' 发送对话完成，用时 ' + (Date.now() - t0) + 'ms');
 }
 
 async function listTasks() {
-  const url = BaseUrl + TasksPath + '?page=1&size=10&status=pending%2Cprocessing';
+  // 按约束：账号永远只有一个任务。不按状态过滤（否则 finished/idle 的任务会被漏掉），
+  // 拉全部任务，交给 pickTaskId 取第一个。绝不创建新任务。
+  const url = BaseUrl + TasksPath + '?page=1&size=24';
   let r = await httpGet(url);
   if (r.status === 401) {
     await reloginIfNeeded();
@@ -371,34 +427,6 @@ function pickTaskId(tasks) {
   if (!tasks || tasks.length === 0) return null;
   for (const t of tasks) if (t.status === 'processing') return t.id;
   return tasks[0].id;
-}
-
-async function createNewTask(content) {
-  const body = JSON.stringify({
-    content: content,
-    cli_name: 'opencode',
-    model_id: DefaultModelId,
-    image_id: DefaultImageId,
-    host_id: DefaultHostId,
-    repo: { branch: '' },
-    resource: { core: 2, memory: 8589934592 },
-  });
-
-  let r = await sendRequest('POST', BaseUrl + TasksPath, body);
-  if (r.status === 401) {
-    await reloginIfNeeded();
-    r = await sendRequest('POST', BaseUrl + TasksPath, body);
-  }
-  if (r.status < 200 || r.status >= 300) {
-    logw('创建任务返回 ' + r.status + '：' + trunc(r.body, 200));
-    return null;
-  }
-  try {
-    const obj = JSON.parse(r.body);
-    return (obj && (obj.id || (obj.data && obj.data.id))) || extractString(r.body, 'id');
-  } catch (_) {
-    return extractString(r.body, 'id');
-  }
 }
 
 // ===============================================================
@@ -720,10 +748,25 @@ function loadSession() {
 // 帧结构（已抓包确认）：
 //   外层 {"type":"user-input","data": BASE64( {"content": BASE64(utf8(text)), "attachments":[]} )}
 //   服务端应用层心跳 {"type":"ping","data":null} -> 回 {"type":"pong","data":null}
-function sendViaWebSocket(taskId, content) {
+//
+// 会话生命周期帧（2026-08-08 probe_session.js watch 实测确认）：
+//   task-started -> 服务端已受理本轮输入（= 发送成功）
+//   task-running -> 会话进行中（增量：thought/message/usage 等，可多帧）
+//   task-ended   -> 本轮会话结束，data 解码为 {"exit_code":0,"message":"completed"}
+// 注意：任务顶层 status 恒为 processing、vm 恒为 online，都【不能】用来判断会话是否在跑。
+//
+// 返回 Promise<{ok, started, ended, exitCode}>：
+//   ok=false            连接/发送失败
+//   ok=true,ended=true  收到 task-ended（本轮真正完成；exitCode 为退出码）
+//   ok=true,ended=false 帧已发出但在 timeoutMs 内没等到 task-ended（= 本轮没结束/卡住）
+function sendViaWebSocket(taskId, content, timeoutMs) {
+  const waitMs = timeoutMs && timeoutMs > 0 ? timeoutMs : 60000;
   return new Promise((resolve) => {
     let settled = false;
     let pings = 0;
+    let started = false;
+    let ended = false;
+    let exitCode = null;
     const wsT0 = Date.now();
     const done = (ok) => {
       if (settled) return;
@@ -731,7 +774,7 @@ function sendViaWebSocket(taskId, content) {
       try {
         ws.close();
       } catch (_) {}
-      resolve(ok);
+      resolve({ ok: ok, started: started, ended: ended, exitCode: exitCode });
     };
 
     const query = '?id=' + encodeURIComponent(taskId) + '&mode=' + WsMode;
@@ -750,15 +793,17 @@ function sendViaWebSocket(taskId, content) {
       });
     } catch (ex) {
       loge('WS(send) 构造异常：' + errMsg(ex));
-      resolve(false);
+      resolve({ ok: false, started: false, ended: false, exitCode: null });
       return;
     }
 
-    // 整体超时（握手 + 发送 + 读一小段）。
+    // 整体超时（握手 + 发送 + 等 task-ended）。到点仍未收到 task-ended
+    // 则按“本轮没结束/卡住”处理（ended=false），由调用方决定重试/下一轮先 cancel。
     const overall = setTimeout(() => {
-      logw('WS(send) 整体超时（9s），按成功处理（帧已发出）。ping=' + pings);
+      logw('WS(send) 等待 task-ended 超时（' + (waitMs / 1000).toFixed(0) + 's）：'
+        + 'started=' + started + ' ended=' + ended + '，判定本轮未结束。ping=' + pings);
       done(true);
-    }, 9000);
+    }, waitMs);
 
     ws.addEventListener('open', () => {
       logd('WS(send) 握手成功（' + (Date.now() - wsT0) + 'ms），发送用户输入帧 ...');
@@ -766,12 +811,8 @@ function sendViaWebSocket(taskId, content) {
         const inner = JSON.stringify({ content: base64Utf8(content), attachments: [] });
         const frame = JSON.stringify({ type: 'user-input', data: base64Utf8(inner) });
         ws.send(frame);
-        logd('WS(send) 已发送帧 ' + Buffer.byteLength(frame, 'utf8') + 'B，等待 6s 读心跳 ...');
-        // 已发出，给服务端 6 秒处理并回读心跳。
-        setTimeout(() => {
-          clearTimeout(overall);
-          done(true);
-        }, 6000);
+        logd('WS(send) 已发送帧 ' + Buffer.byteLength(frame, 'utf8') + 'B，等待 task-ended（最多 '
+          + (waitMs / 1000).toFixed(0) + 's）...');
       } catch (ex) {
         loge('WS(send) 发送异常：' + errMsg(ex));
         clearTimeout(overall);
@@ -780,13 +821,28 @@ function sendViaWebSocket(taskId, content) {
     });
 
     ws.addEventListener('message', (evt) => {
-      // 回应应用层心跳，保持连接活跃。
       try {
         const txt = typeof evt.data === 'string' ? evt.data : '';
+        if (!txt) return;
+        // 应用层心跳：回 pong 保活。
         if (txt.indexOf('"type":"ping"') >= 0) {
           pings++;
           ws.send(JSON.stringify({ type: 'pong', data: null }));
           logd('WS(send) 收到 ping，已回 pong（第 ' + pings + ' 次）');
+          return;
+        }
+        // 会话生命周期帧。
+        let o;
+        try { o = JSON.parse(txt); } catch (_) { return; }
+        if (o.type === 'task-started') {
+          started = true;
+          logd('WS(send) 收到 task-started（服务端已受理，用时 ' + (Date.now() - wsT0) + 'ms）');
+        } else if (o.type === 'task-ended') {
+          ended = true;
+          exitCode = decodeExitCode(o.data);
+          logd('WS(send) 收到 task-ended（exit_code=' + exitCode + '，用时 ' + (Date.now() - wsT0) + 'ms）');
+          clearTimeout(overall);
+          done(true);
         }
       } catch (_) {}
     });
@@ -798,9 +854,114 @@ function sendViaWebSocket(taskId, content) {
     });
 
     ws.addEventListener('close', (evt) => {
-      // 若在发送前就关闭则视为失败；发送后关闭由上面的定时器处理。
+      // 若在收到 task-ended 前就关闭：已 started 视为本轮未结束（ended=false），否则视为失败。
       logd('WS(send) 关闭 code=' + (evt && evt.code != null ? evt.code : '?')
-        + '，存活 ' + (Date.now() - wsT0) + 'ms，ping=' + pings);
+        + '，存活 ' + (Date.now() - wsT0) + 'ms，ping=' + pings + '，started=' + started + '，ended=' + ended);
+      if (!settled) {
+        clearTimeout(overall);
+        done(started ? true : false);
+      }
+    });
+  });
+}
+
+// 解出 task-ended 帧里的 exit_code（data 为 BASE64(utf8(JSON))）。失败返回 null。
+function decodeExitCode(data) {
+  try {
+    if (typeof data !== 'string' || !data) return null;
+    const json = Buffer.from(data, 'base64').toString('utf8');
+    const o = JSON.parse(json);
+    return typeof o.exit_code === 'number' ? o.exit_code : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ===============================================================
+// 终止当前会话（等价网页对话区的"取消"按钮）
+// ---------------------------------------------------------------
+// 浏览器抓包 + 前端 bundle 逆向双重确认（2026-08-08）：
+//   前端 sendCancel(){ this.sendMessage({type:"user-cancel"}) }
+//   sendMessage(t){ ...this.socket.send(JSON.stringify(t))... }
+//   this.socket 就是任务的 stream 连接（与发 user-input 同一条 WebSocket）。
+//   => 取消帧就是裸 JSON  {"type":"user-cancel"}（无 data 字段，不做 base64）。
+//   服务端 processMessage 里 case "user-cancel" 只中断当前 agent 执行，
+//   不关闭 socket、不涉及任务/VM/文件（disconnect() 是另一个独立方法）。
+//
+// 关键安全约束：这里【只终止会话/当前对话轮次】，绝不调用 /tasks/stop、
+// 也不走 control 通道，任务、开发环境、文件均不受影响。
+function cancelSession(taskId) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const wsT0 = Date.now();
+    let ws;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws.close();
+      } catch (_) {}
+      resolve(ok);
+    };
+
+    // 与发送同一 stream 通道；mode 用 new（与 sendViaWebSocket 保持一致）。
+    const url = 'wss://' + Host + WsStreamPath + '?id=' + encodeURIComponent(taskId) + '&mode=' + WsMode;
+    logd('WS(cancel) 连接 ' + shortPath(url));
+    try {
+      ws = new WebSocket(url, {
+        headers: {
+          Cookie: buildCookieHeader(),
+          Origin: BaseUrl,
+          'User-Agent': UserAgent,
+        },
+      });
+    } catch (ex) {
+      loge('WS(cancel) 构造异常：' + errMsg(ex));
+      resolve(false);
+      return;
+    }
+
+    // 取消是即时动作：握手 -> 发一帧 -> 给服务端 2s 处理即可。
+    const overall = setTimeout(() => {
+      logw('WS(cancel) 整体超时（8s），按已发出处理。');
+      done(true);
+    }, 8000);
+
+    ws.addEventListener('open', () => {
+      logd('WS(cancel) 握手成功（' + (Date.now() - wsT0) + 'ms），发送 user-cancel ...');
+      try {
+        const frame = JSON.stringify({ type: 'user-cancel' });
+        ws.send(frame);
+        logd('WS(cancel) 已发送 ' + frame);
+        setTimeout(() => {
+          clearTimeout(overall);
+          done(true);
+        }, 2000);
+      } catch (ex) {
+        loge('WS(cancel) 发送异常：' + errMsg(ex));
+        clearTimeout(overall);
+        done(false);
+      }
+    });
+
+    ws.addEventListener('message', (evt) => {
+      try {
+        const txt = typeof evt.data === 'string' ? evt.data : '';
+        if (txt.indexOf('"type":"ping"') >= 0) {
+          ws.send(JSON.stringify({ type: 'pong', data: null }));
+        }
+      } catch (_) {}
+    });
+
+    ws.addEventListener('error', (evt) => {
+      loge('WS(cancel) 错误：' + (evt && evt.message ? evt.message : '连接失败'));
+      clearTimeout(overall);
+      done(false);
+    });
+
+    ws.addEventListener('close', (evt) => {
+      logd('WS(cancel) 关闭 code=' + (evt && evt.code != null ? evt.code : '?')
+        + '，存活 ' + (Date.now() - wsT0) + 'ms');
       if (!settled) {
         clearTimeout(overall);
         done(false);
@@ -1011,9 +1172,63 @@ function sleep(ms) {
 // - loge      : ERROR 异常/失败
 // - logd      : DEBUG 排查细节（每个 HTTP/WS 请求耗时、字节数、帧内容等），默认不打印
 let _debug = false;
+// 当前日志文件的日期（YYYY-MM-DD）。跨天时切换文件并清理过期日志。
+let _logDateKey = '';
+// 日志保留天数（由 initLogFile() 依据 config 初始化）。0 表示不清理。
+let _logRetentionDays = 3;
 
 function setDebug(on) {
   _debug = !!on;
+}
+
+// 启动时调用：确保 logs/ 存在、记录保留天数、按当天切好文件并清理一次过期日志。
+function initLogFile(retentionDays) {
+  _logRetentionDays = Number.isFinite(retentionDays) ? retentionDays : _logRetentionDays;
+  try {
+    if (!fs.existsSync(LogDir)) fs.mkdirSync(LogDir, { recursive: true });
+  } catch (_) {}
+  rollLogIfNeeded();
+}
+
+// 返回本地日期键 YYYY-MM-DD。
+function _dateKey(d) {
+  const p2 = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
+}
+
+// 当前应写入的日志文件路径（logs/YYYY-MM-DD.log）。
+function _currentLogPath() {
+  return path.join(LogDir, _logDateKey + '.log');
+}
+
+// 若日期变了（或首次），切换到当天日志文件并清理过期文件。
+function rollLogIfNeeded() {
+  const key = _dateKey(new Date());
+  if (key === _logDateKey) return;
+  _logDateKey = key;
+  cleanupOldLogs();
+}
+
+// 删除 logs/ 下超过保留天数的 *.log。保留天数为当天 + 之前 (N-1) 天，共 N 天。
+function cleanupOldLogs() {
+  if (!_logRetentionDays || _logRetentionDays <= 0) return; // 0/负数 = 不清理
+  try {
+    if (!fs.existsSync(LogDir)) return;
+    // 计算保留窗口起点（含当天在内共 N 天）：cutoff = 今天 - (N-1) 天的 00:00。
+    const cutoff = new Date();
+    cutoff.setHours(0, 0, 0, 0);
+    cutoff.setDate(cutoff.getDate() - (_logRetentionDays - 1));
+    const cutoffKey = _dateKey(cutoff);
+    for (const name of fs.readdirSync(LogDir)) {
+      const m = /^(\d{4}-\d{2}-\d{2})\.log$/.exec(name);
+      if (!m) continue;
+      if (m[1] < cutoffKey) {
+        try {
+          fs.unlinkSync(path.join(LogDir, name));
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
 }
 
 function _emit(level, msg) {
@@ -1026,6 +1241,14 @@ function _emit(level, msg) {
   if (level === 'ERROR') console.error(line);
   else if (level === 'WARN') console.warn(line);
   else console.log(line);
+  // 落盘：文件行带完整日期前缀，便于跨天检索；跨天自动切换文件并清理旧日志。
+  try {
+    if (!fs.existsSync(LogDir)) fs.mkdirSync(LogDir, { recursive: true });
+    rollLogIfNeeded();
+    fs.appendFileSync(_currentLogPath(), _logDateKey + ' ' + line + '\n');
+  } catch (_) {
+    // 写文件失败不影响主流程（控制台已输出）。
+  }
 }
 
 function logi(msg) { _emit('INFO', msg); }
@@ -1035,10 +1258,20 @@ function logd(msg) { if (_debug) _emit('DEBUG', msg); }
 // 兼容旧调用：log() == INFO。
 function log(msg) { _emit('INFO', msg); }
 
+// 把本地时间格式化成 "YYYY-MM-DD HH:MM:SS.mmm"，用于日志里打印完整时间戳。
+// 传入毫秒时间戳（Date.now()）；不传则用当前时间。
+function nowStamp(ms) {
+  const d = ms == null ? new Date() : new Date(ms);
+  const p2 = (n) => String(n).padStart(2, '0');
+  const p3 = (n) => String(n).padStart(3, '0');
+  return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate())
+    + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds())
+    + '.' + p3(d.getMilliseconds());
+}
+
 // 把 error/异常对象规整成可读字符串。
 function errMsg(ex) {
   if (!ex) return '(unknown)';
-  if (typeof ex === 'string') return ex;
   let s = ex.message ? ex.message : String(ex);
   if (ex.code) s += ' [code=' + ex.code + ']';
   if (ex.cause && ex.cause.message) s += ' <- ' + ex.cause.message;
